@@ -1,0 +1,1011 @@
+#!/usr/bin/env python3
+"""agent-change-log: canonical, append-only history of persistent computer changes.
+
+The authoritative store is events.jsonl.  CHANGELOG.md is always derived from it
+and must never be edited by hand.
+"""
+
+from __future__ import annotations
+
+import argparse
+import errno
+import fcntl
+import json
+import math
+import os
+import re
+import socket
+import sys
+import stat
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+SCHEMA = "agent-change-log/1"
+FS_ACTIONS = ("create", "modify", "delete", "move")
+CATEGORIES = ("filesystem", "system")
+ACTION_RE = re.compile(r"^[a-z][a-z0-9_-]{0,39}$")
+META_KEY_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_.-]{0,63}$")
+MAX_PATHS = 100
+MAX_DESCRIPTION = 4000
+MAX_RESOURCE = 500
+MAX_META_KEYS = 20
+
+ALLOWED_KEYS = {
+    "schema",
+    "id",
+    "ts",
+    "host",
+    "actor",
+    "session",
+    "category",
+    "action",
+    "paths",
+    "source",
+    "destination",
+    "resource",
+    "description",
+    "cwd",
+    "tool",
+    "tool_call_id",
+    "parent_tool_call_id",
+    "origin",
+    "meta",
+    "redacted",
+}
+
+_TOKEN_PATTERNS = (
+    re.compile(r"sk-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{12,}"),
+    re.compile(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+        re.DOTALL,
+    ),
+)
+_KEY_VALUE_RE = re.compile(
+    r"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|"
+    r"private[_-]?key|authorization|cookie|client[_-]?secret)\b"
+    r"(\s*[:=]\s*)([^\s,;]+)"
+)
+_CLI_SECRET_RE = re.compile(
+    r"(?i)(--?(?:password|passwd|token|api-key|apikey|secret|authorization|cookie)"
+    r'''(?:\s+|=))(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\S+)'''
+)
+_URL_CREDENTIAL_RE = re.compile(r"(\b[a-z][a-z0-9+.-]*://)[^/\s@]+@")
+_SECRET_KEYS = frozenset({
+    "password", "passwd", "pwd", "secret", "token", "apikey", "accesskey",
+    "privatekey", "authorization", "cookie", "clientsecret", "accesstoken",
+    "refreshtoken", "idtoken", "credentials",
+})
+_QUOTED_SECRET_RE = re.compile(
+    r'''(?i)(["']?(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|'''
+    r'''private[_-]?key|authorization|cookie|client[_-]?secret)["']?\s*[:=]\s*)'''
+    r'''(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^\s,;]+)'''
+)
+
+
+def _secret_key(key) -> bool:
+    return isinstance(key, str) and re.sub(r"[^a-z0-9]", "", key.lower()) in _SECRET_KEYS
+
+
+class ChangeLogError(Exception):
+    """A user-facing logger failure."""
+
+
+def default_log_dir() -> Path:
+    configured = os.environ.get("AGENT_CHANGE_LOG_DIR")
+    if configured:
+        return Path(os.path.expanduser(configured))
+    return Path.home() / ".local" / "state" / "agent-change-log"
+
+
+def _clean(value: str) -> str:
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+    value = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", value)
+    return value.replace("\n", " ").strip()
+
+
+def redact(value):
+    """Recursively redact likely secrets from strings in an event value."""
+    if isinstance(value, str):
+        original = value
+        for pattern in _TOKEN_PATTERNS:
+            value = pattern.sub("<redacted>", value)
+        value = _QUOTED_SECRET_RE.sub(r"\1<redacted>", value)
+        value = _KEY_VALUE_RE.sub(r"\1\2<redacted>", value)
+        value = _CLI_SECRET_RE.sub(r"\1<redacted>", value)
+        value = _URL_CREDENTIAL_RE.sub(r"\1<redacted>@", value)
+        return value, value != original
+    if isinstance(value, list):
+        changed = False
+        result = []
+        for item in value:
+            cleaned, item_changed = redact(item)
+            result.append(cleaned)
+            changed = changed or item_changed
+        return result, changed
+    if isinstance(value, dict):
+        changed = False
+        result = {}
+        for key, item in value.items():
+            if _secret_key(key):
+                cleaned, item_changed = "<redacted>", item != "<redacted>"
+            else:
+                cleaned, item_changed = redact(item)
+            result[key] = cleaned
+            changed = changed or item_changed
+        return result, changed
+    return value, False
+
+
+def _normalize_path(raw: str) -> str:
+    cleaned = _clean(raw)
+    if not cleaned:
+        raise ChangeLogError("empty path")
+    if "\x00" in raw or "\n" in raw or "\r" in raw:
+        raise ChangeLogError(f"path contains a control character: {cleaned!r}")
+    return os.path.normpath(os.path.abspath(os.path.expanduser(cleaned)))
+
+
+def _truncate(value: str, limit: int) -> str:
+    return value if len(value) <= limit else value[: limit - 1] + "…"
+
+
+def _now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="microseconds")
+
+
+def _iso_parse(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("timestamp has no timezone offset")
+    return parsed
+
+
+def _default_actor(explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    configured = os.environ.get("AGENT_CHANGE_LOG_ACTOR")
+    if configured:
+        return configured
+    if os.environ.get("PI_CODING_AGENT", "").lower() == "true":
+        return "pi-agent"
+    return "cli"
+
+
+def make_event(
+    *,
+    category: str,
+    action: str,
+    description: str,
+    paths: list[str] | None = None,
+    source: str | None = None,
+    destination: str | None = None,
+    resource: str | None = None,
+    actor: str | None = None,
+    session: str | None = None,
+    cwd: str | None = None,
+    tool: str | None = None,
+    tool_call_id: str | None = None,
+    parent_tool_call_id: str | None = None,
+    origin: str | None = None,
+    meta: dict | None = None,
+) -> dict:
+    # Leave strings intact until finalize_event redacts them before truncation.
+    event = {
+        "schema": SCHEMA,
+        "id": str(uuid.uuid4()),
+        "ts": _now_iso(),
+        "host": socket.gethostname(),
+        "actor": _default_actor(actor),
+        "category": category,
+        "action": action,
+        "description": description,
+    }
+    session = session or os.environ.get("PI_SESSION_ID")
+    if session:
+        event["session"] = session
+    if cwd:
+        event["cwd"] = cwd
+    if tool:
+        event["tool"] = tool
+    if tool_call_id:
+        event["tool_call_id"] = tool_call_id
+    if parent_tool_call_id:
+        event["parent_tool_call_id"] = parent_tool_call_id
+    event["origin"] = origin or "cli"
+    if paths:
+        event["paths"] = paths
+    if source:
+        event["source"] = source
+    if destination:
+        event["destination"] = destination
+    if resource:
+        event["resource"] = resource
+    if meta:
+        event["meta"] = meta
+    return finalize_event(event)
+
+
+def finalize_event(event: dict) -> dict:
+    """Apply defaults, redaction, normalization, then validate."""
+    if not isinstance(event, dict):
+        raise ChangeLogError("event must be a JSON object")
+    event, changed_before_normalization = redact(dict(event))
+    previously_redacted = event.get("redacted") is True
+    event.setdefault("schema", SCHEMA)
+    event.setdefault("id", str(uuid.uuid4()))
+    event.setdefault("ts", _now_iso())
+    event.setdefault("host", socket.gethostname())
+    event.setdefault("actor", _default_actor(None))
+    event.setdefault("origin", "cli")
+    if not event.get("session") and os.environ.get("PI_SESSION_ID"):
+        event["session"] = os.environ["PI_SESSION_ID"]
+
+    if event.get("category") == "filesystem" and event.get("action") == "move":
+        source = event.get("source")
+        destination = event.get("destination")
+        if source and destination:
+            if event.get("paths") is not None and not isinstance(event["paths"], list):
+                raise ChangeLogError("paths must be a list")
+            paths = list(event.get("paths") or [])
+            for path in (source, destination):
+                normalized = _normalize_path(str(path))
+                if normalized not in paths:
+                    paths.append(normalized)
+            event["paths"] = paths
+            event["source"] = _normalize_path(str(source))
+            event["destination"] = _normalize_path(str(destination))
+
+    if "paths" in event and event["paths"] is not None:
+        if not isinstance(event["paths"], list):
+            raise ChangeLogError("paths must be a list")
+        normalized_paths = []
+        for item in event["paths"]:
+            if not isinstance(item, str):
+                raise ChangeLogError("each path must be a string")
+            path = _normalize_path(item)
+            if path not in normalized_paths:
+                normalized_paths.append(path)
+        event["paths"] = normalized_paths
+
+    for field in ("cwd",):
+        if event.get(field):
+            event[field] = _normalize_path(str(event[field]))
+
+    for field in ("source", "destination"):
+        if event.get(field):
+            event[field] = _normalize_path(str(event[field]))
+
+    if event.get("description") is not None:
+        event["description"] = _truncate(_clean(str(event["description"])), MAX_DESCRIPTION)
+    if event.get("resource") is not None:
+        event["resource"] = _truncate(_clean(str(event["resource"])), MAX_RESOURCE)
+    for field in ("host", "actor", "session", "tool", "tool_call_id", "parent_tool_call_id", "origin"):
+        if event.get(field) is not None:
+            event[field] = _truncate(_clean(str(event[field])), 500)
+    if event.get("meta") is not None and not isinstance(event["meta"], dict):
+        raise ChangeLogError("meta must be an object")
+
+    event, changed = redact(event)
+    if changed or changed_before_normalization or previously_redacted:
+        event["redacted"] = True
+    else:
+        event.pop("redacted", None)
+
+    validate_event(event)
+    return event
+
+
+def validate_event(event: dict) -> None:
+    if not isinstance(event, dict):
+        raise ChangeLogError("event is not a JSON object")
+    unknown = set(event) - ALLOWED_KEYS
+    if unknown:
+        raise ChangeLogError(f"unknown event fields: {', '.join(sorted(unknown))}")
+    missing = [key for key in ("schema", "id", "ts", "host", "actor", "category", "action", "description") if key not in event]
+    if missing:
+        raise ChangeLogError(f"missing required fields: {', '.join(missing)}")
+    if event["schema"] != SCHEMA:
+        raise ChangeLogError(f"unsupported schema {event['schema']!r}")
+    if not isinstance(event["id"], str) or not event["id"] or len(event["id"]) > 200:
+        raise ChangeLogError("id must be a non-empty string")
+    if not isinstance(event["ts"], str):
+        raise ChangeLogError("ts must be a string")
+    try:
+        _iso_parse(event["ts"])
+    except ValueError as exc:
+        raise ChangeLogError(f"invalid ts {event['ts']!r}: {exc}") from exc
+    if not isinstance(event["description"], str) or not event["description"].strip():
+        raise ChangeLogError("description must be a non-empty string")
+    if len(event["description"]) > MAX_DESCRIPTION:
+        raise ChangeLogError("description is too long")
+    if event["category"] not in CATEGORIES:
+        raise ChangeLogError(f"category must be one of {', '.join(CATEGORIES)}")
+    if not isinstance(event["action"], str) or not ACTION_RE.fullmatch(event["action"]):
+        raise ChangeLogError("action must match ^[a-z][a-z0-9_-]{0,39}$")
+    for field in ("host", "actor", "origin"):
+        if not isinstance(event.get(field), str) or not event[field]:
+            raise ChangeLogError(f"{field} must be a non-empty string")
+
+    paths = event.get("paths", [])
+    if paths is None:
+        paths = []
+    if not isinstance(paths, list) or len(paths) > MAX_PATHS:
+        raise ChangeLogError(f"paths must be a list of at most {MAX_PATHS} entries")
+    for path in paths:
+        if not isinstance(path, str) or not os.path.isabs(path):
+            raise ChangeLogError(f"path is not absolute: {path!r}")
+
+    for field in ("cwd", "source", "destination"):
+        if event.get(field) is not None and (
+            not isinstance(event[field], str) or not os.path.isabs(event[field])
+        ):
+            raise ChangeLogError(f"{field} must be an absolute path")
+
+    if event["category"] == "filesystem":
+        if event["action"] == "move":
+            if not event.get("source") or not event.get("destination"):
+                raise ChangeLogError("move events require source and destination")
+            if event["source"] == event["destination"]:
+                raise ChangeLogError("move source and destination are identical")
+            if event["source"] not in paths or event["destination"] not in paths:
+                raise ChangeLogError("move paths must contain source and destination")
+        elif not paths:
+            raise ChangeLogError("filesystem events require at least one path")
+        if event["action"] not in FS_ACTIONS:
+            raise ChangeLogError(f"unknown filesystem action {event['action']!r}")
+    else:
+        if not isinstance(event.get("resource"), str) or not event["resource"].strip():
+            raise ChangeLogError("system events require a non-empty string resource")
+        if len(event["resource"]) > MAX_RESOURCE:
+            raise ChangeLogError("resource is too long")
+
+    meta = event.get("meta")
+    if meta is not None:
+        if not isinstance(meta, dict) or len(meta) > MAX_META_KEYS:
+            raise ChangeLogError("meta must be an object with at most 20 entries")
+        for key, value in meta.items():
+            if not isinstance(key, str) or not META_KEY_RE.fullmatch(key):
+                raise ChangeLogError(f"invalid meta key {key!r}")
+            if not isinstance(value, (str, int, float, bool, type(None))):
+                raise ChangeLogError(f"meta value for {key!r} must be a scalar")
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ChangeLogError(f"meta value for {key!r} must be finite")
+            if isinstance(value, str) and len(value) > 1000:
+                raise ChangeLogError(f"meta value for {key!r} is too long")
+
+
+def _open_log_dir(path: Path) -> int:
+    """Walk from / using pinned descriptors; never follow directory symlinks."""
+    parts = Path(os.path.abspath(path)).parts[1:]
+    if not parts:
+        raise ChangeLogError("use a dedicated log directory, not the filesystem root")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts:
+            try:
+                os.mkdir(part, 0o700, dir_fd=fd)
+            except FileExistsError:
+                pass
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        if os.fstat(fd).st_uid != os.geteuid():
+            raise ChangeLogError("log directory must be owned by the current user")
+        os.fchmod(fd, 0o700)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _open_private(directory: int, name: str, flags: int) -> int:
+    fd = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+            raise ChangeLogError(f"{name} must be a user-owned regular file with one link")
+        os.fchmod(fd, 0o600)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+class LogLock:
+    def __init__(self, log_dir: Path, exclusive: bool = True):
+        self.log_dir = log_dir
+        self.exclusive = exclusive
+        self.fd: int | None = None
+        self.directory: int | None = None
+
+    def __enter__(self):
+        self.directory = _open_log_dir(self.log_dir)
+        try:
+            self.fd = _open_private(self.directory, "events.jsonl.lock", os.O_CREAT | os.O_RDWR)
+            fcntl.flock(self.fd, fcntl.LOCK_EX if self.exclusive else fcntl.LOCK_SH)
+            return self
+        except BaseException:
+            self.__exit__(None, None, None)
+            raise
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.fd is not None:
+            os.close(self.fd)  # Closing releases flock, including on exceptions.
+            self.fd = None
+        if self.directory is not None:
+            os.close(self.directory)
+            self.directory = None
+
+
+def load_events(log_dir: Path, *, directory: int) -> list[dict]:
+    path = log_dir / "events.jsonl"
+    try:
+        fd = _open_private(directory, "events.jsonl", os.O_RDONLY)
+    except FileNotFoundError:
+        return []
+    events: list[dict] = []
+    ids: set[str] = set()
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, 1):
+                if not line.strip():
+                    if line_number == 1 or line.endswith("\n"):
+                        raise ChangeLogError(
+                            f"{path}: blank line at line {line_number}"
+                        )
+                    continue
+                if len(line.encode("utf-8")) > 1024 * 1024:
+                    raise ChangeLogError(f"{path}: line {line_number} is too long")
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ChangeLogError(
+                        f"{path}: invalid JSON at line {line_number}: {exc}"
+                    ) from exc
+                try:
+                    validate_event(event)
+                except ChangeLogError as exc:
+                    raise ChangeLogError(f"{path}: line {line_number}: {exc}") from exc
+                if event["id"] in ids:
+                    raise ChangeLogError(
+                        f"{path}: duplicate event id {event['id']!r} at line {line_number}"
+                    )
+                ids.add(event["id"])
+                events.append(event)
+    except UnicodeDecodeError as exc:
+        raise ChangeLogError(f"{path}: not valid UTF-8: {exc}") from exc
+    return events
+
+
+def _ensure_trailing_newline(fd: int) -> None:
+    size = os.fstat(fd).st_size
+    if size and os.pread(fd, 1, size - 1) != b"\n":
+        raise ChangeLogError("events.jsonl does not end with a newline; refusing to append")
+
+
+def _write_all(fd: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(fd, view)
+        if written <= 0:
+            raise OSError("short write while appending event")
+        view = view[written:]
+
+
+def _fsync_dir(directory: int) -> None:
+    os.fsync(directory)
+
+
+def append_event(log_dir: Path, event: dict, *, write_report: bool = True) -> dict:
+    event = finalize_event(event)
+    path = log_dir / "events.jsonl"
+    with LogLock(log_dir, exclusive=True) as lock:
+        existing = load_events(log_dir, directory=lock.directory)
+        if any(item["id"] == event["id"] for item in existing):
+            raise ChangeLogError(f"event id already exists: {event['id']}")
+        payload = (
+            json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+        fd = _open_private(lock.directory, "events.jsonl", os.O_RDWR | os.O_CREAT | os.O_APPEND)
+        try:
+            _ensure_trailing_newline(fd)
+            _write_all(fd, payload)
+            os.fsync(fd)
+        except OSError as exc:
+            raise ChangeLogError(f"cannot append to {path}: {exc}") from exc
+        finally:
+            os.close(fd)
+        _fsync_dir(lock.directory)
+        if write_report:
+            write_report_file(log_dir, existing + [event], directory=lock.directory)
+    return event
+
+
+def _event_time(event: dict) -> datetime:
+    return _iso_parse(event["ts"])
+
+
+def _sort_key(event: dict):
+    return (_event_time(event), event["id"])
+
+
+def _code(text: str) -> str:
+    text = str(text)
+    fence = "`"
+    while fence in text:
+        fence += "`"
+    return f"{fence}{text}{fence}"
+
+
+def _plain(text: str) -> str:
+    replacements = {
+        "\\": "\\\\",
+        "`": "\\`",
+        "*": "\\*",
+        "_": "\\_",
+        "[": "\\[",
+        "]": "\\]",
+        "<": "&lt;",
+        ">": "&gt;",
+        "|": "\\|",
+    }
+    return "".join(replacements.get(char, char) for char in str(text))
+
+
+def _event_paths(event: dict) -> list[str]:
+    paths = list(event.get("paths") or [])
+    for field in ("source", "destination"):
+        value = event.get(field)
+        if value and value not in paths:
+            paths.append(value)
+    return paths
+
+
+def _ancestor_dirs(directory: str) -> list[str]:
+    directory = os.path.normpath(directory)
+    if directory == "/":
+        return ["/"]
+    ancestors = []
+    current = directory
+    while True:
+        ancestors.append(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            break
+        current = parent
+    ancestors.reverse()
+    if ancestors and ancestors[0] == "/":
+        ancestors = ancestors[1:]
+    return ancestors
+
+
+def _event_line(event: dict) -> str:
+    action = event["action"]
+    if action == "move":
+        affected = f"{_code(event['source'])} → {_code(event['destination'])}"
+    else:
+        paths = _event_paths(event)
+        affected = ", ".join(_code(path) for path in paths) if paths else ""
+    bits = [f"- **{event['ts']}** {_code(action)}"]
+    if affected:
+        bits.append(f"— {affected}")
+    bits.append(f"— {_plain(event['description'])}")
+    details = []
+    if event.get("resource"):
+        details.append(f"resource {_code(event['resource'])}")
+    details.append(f"actor {_code(event['actor'])}")
+    if event.get("session"):
+        details.append(f"session {_code(event['session'])}")
+    if event.get("tool"):
+        details.append(f"tool {_code(event['tool'])}")
+    details.append(f"id {_code(event['id'])}")
+    if event.get("redacted"):
+        details.append("secret-redacted")
+    bits.append(f"({'; '.join(details)})")
+    return " ".join(bits)
+
+
+def _render_dir(
+    node: str,
+    children: dict[str, set[str]],
+    direct: dict[str, list[dict]],
+    level: int,
+    lines: list[str],
+    *,
+    is_root: bool,
+) -> None:
+    rendered = not is_root or bool(direct.get(node))
+    current_level = min(level, 6)
+    if rendered:
+        lines.append("")
+        lines.append(f"{'#' * current_level} {_code(node)}")
+        if current_level == 6 and level > 6:
+            parent = os.path.dirname(node)
+            lines.append("")
+            lines.append(
+                f"> Markdown's heading limit is 6. This directory is nested under {_code(parent)}; "
+                "the full absolute path above identifies it."
+            )
+        entries = sorted(direct.get(node, []), key=_sort_key)
+        if entries:
+            lines.append("")
+            for event in entries:
+                lines.append(_event_line(event))
+    child_level = current_level + 1 if rendered else current_level
+    for child in sorted(children.get(node, set())):
+        _render_dir(
+            child,
+            children,
+            direct,
+            child_level,
+            lines,
+            is_root=False,
+        )
+
+
+def build_report(events: list[dict]) -> str:
+    fs_events = [event for event in events if event["category"] == "filesystem"]
+    sys_events = [event for event in events if event["category"] == "system"]
+
+    direct: dict[str, list[dict]] = {}
+    children: dict[str, set[str]] = {"/": set()}
+    for event in fs_events:
+        affected_dirs: set[str] = set()
+        paths = _event_paths(event)
+        for path in paths:
+            affected_dirs.add(os.path.dirname(path) or "/")
+        for directory in affected_dirs:
+            direct.setdefault(directory, []).append(event)
+        for directory in affected_dirs:
+            for component in _ancestor_dirs(directory):
+                children.setdefault(component, set())
+        for directory in affected_dirs:
+            parent = os.path.dirname(directory)
+            if parent == directory:
+                parent = "/"
+            children.setdefault(parent, set()).add(directory)
+            children.setdefault(directory, set())
+            for component in _ancestor_dirs(directory):
+                parent_component = os.path.dirname(component)
+                if parent_component == component:
+                    parent_component = "/"
+                if parent_component != "/" or component != "/":
+                    children.setdefault(parent_component, set()).add(component)
+                children.setdefault(component, set())
+    # Deduplicate root children accidentally added above.
+    children["/"] = {child for child in children["/"] if child != "/"}
+
+    lines = [
+        "# Agent Change Log",
+        "",
+        "Generated from `events.jsonl` by `agent-change-log report`. Do not edit this file;",
+        "edit the canonical event log only through `agent-change-log`.",
+        "",
+    ]
+    latest = max((_event_time(event) for event in events), default=None)
+    lines.append(f"Events: {len(events)}. Filesystem: {len(fs_events)}. System: {len(sys_events)}.")
+    if latest is not None:
+        lines.append(f"Latest event: {latest.isoformat()}.")
+    lines.append("")
+    lines.append("## Filesystem Changes")
+    if not fs_events:
+        lines.append("")
+        lines.append("No filesystem changes recorded.")
+    else:
+        _render_dir("/", children, direct, 3, lines, is_root=True)
+    lines.append("")
+    lines.append("## System Changes")
+    if not sys_events:
+        lines.append("")
+        lines.append("No system changes recorded.")
+    else:
+        grouped: dict[str, list[dict]] = {}
+        for event in sys_events:
+            grouped.setdefault(event["resource"], []).append(event)
+        for resource in sorted(grouped):
+            lines.append("")
+            lines.append(f"### {_code(resource)}")
+            lines.append("")
+            for event in sorted(grouped[resource], key=_sort_key):
+                lines.append(_event_line(event))
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_report_file(log_dir: Path, events: list[dict], *, directory: int) -> None:
+    target = "CHANGELOG.md"
+    content = build_report(events)
+    # The temporary inode is private from creation; rename replaces even a dangling
+    # target symlink without dereferencing or chmod'ing its destination.
+    temp_name = f".CHANGELOG.{uuid.uuid4().hex}.tmp"
+    fd = _open_private(directory, temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, target, src_dir_fd=directory, dst_dir_fd=directory)
+        _fsync_dir(directory)
+    except OSError as exc:
+        raise ChangeLogError("cannot write report; event may already be recorded") from exc
+    finally:
+        try:
+            os.unlink(temp_name, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+
+
+def _read_json_argument(args) -> dict:
+    if args.json and args.file:
+        raise ChangeLogError("use only one of --json and --file")
+    if args.file:
+        try:
+            text = Path(args.file).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ChangeLogError(f"cannot read {args.file}: {exc}") from exc
+    elif args.json:
+        text = args.json
+    else:
+        if sys.stdin.isatty():
+            raise ChangeLogError("record-json requires --json, --file, or JSON on stdin")
+        text = sys.stdin.read()
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ChangeLogError(f"invalid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ChangeLogError("record-json expects exactly one JSON object")
+    return value
+
+
+def _apply_defaults_from_args(event: dict, args) -> dict:
+    event = dict(event)
+    if args.actor:
+        event["actor"] = args.actor
+    if args.session:
+        event["session"] = args.session
+    if getattr(args, "cwd", None):
+        event["cwd"] = args.cwd
+    if getattr(args, "tool", None):
+        event["tool"] = args.tool
+    if getattr(args, "tool_call_id", None):
+        event["tool_call_id"] = args.tool_call_id
+    if getattr(args, "parent_tool_call_id", None):
+        event["parent_tool_call_id"] = args.parent_tool_call_id
+    if getattr(args, "origin", None):
+        event["origin"] = args.origin
+    return event
+
+
+def cmd_file(args) -> int:
+    event = make_event(
+        category="filesystem",
+        action=args.action,
+        description=args.description,
+        paths=args.paths,
+        actor=args.actor,
+        session=args.session,
+        cwd=args.cwd,
+        tool=args.tool,
+        tool_call_id=args.tool_call_id,
+        parent_tool_call_id=args.parent_tool_call_id,
+        origin=args.origin,
+    )
+    append_event(args.log_dir, event, write_report=not args.no_report)
+    if not args.quiet:
+        print(event["id"])
+    return 0
+
+
+def cmd_move(args) -> int:
+    event = make_event(
+        category="filesystem",
+        action="move",
+        description=args.description,
+        paths=[args.source, args.destination],
+        source=args.source,
+        destination=args.destination,
+        actor=args.actor,
+        session=args.session,
+        cwd=args.cwd,
+        tool=args.tool,
+        tool_call_id=args.tool_call_id,
+        parent_tool_call_id=args.parent_tool_call_id,
+        origin=args.origin,
+    )
+    append_event(args.log_dir, event, write_report=not args.no_report)
+    if not args.quiet:
+        print(event["id"])
+    return 0
+
+
+def cmd_system(args) -> int:
+    event = make_event(
+        category="system",
+        action=args.action,
+        description=args.description,
+        paths=args.path or None,
+        resource=args.resource,
+        actor=args.actor,
+        session=args.session,
+        cwd=args.cwd,
+        tool=args.tool,
+        tool_call_id=args.tool_call_id,
+        parent_tool_call_id=args.parent_tool_call_id,
+        origin=args.origin,
+    )
+    append_event(args.log_dir, event, write_report=not args.no_report)
+    if not args.quiet:
+        print(event["id"])
+    return 0
+
+
+def cmd_record_json(args) -> int:
+    event = _apply_defaults_from_args(_read_json_argument(args), args)
+    event = finalize_event(event)
+    append_event(args.log_dir, event, write_report=not args.no_report)
+    if not args.quiet:
+        print(event["id"])
+    return 0
+
+
+def cmd_report(args) -> int:
+    with LogLock(args.log_dir, exclusive=True) as lock:
+        events = load_events(args.log_dir, directory=lock.directory)
+        write_report_file(args.log_dir, events, directory=lock.directory)
+    if not args.quiet:
+        print(f"wrote {args.log_dir / 'CHANGELOG.md'} ({len(events)} events)")
+    return 0
+
+
+def cmd_validate(args) -> int:
+    with LogLock(args.log_dir, exclusive=False) as lock:
+        events = load_events(args.log_dir, directory=lock.directory)
+    if not args.quiet:
+        fs_count = sum(1 for event in events if event["category"] == "filesystem")
+        sys_count = len(events) - fs_count
+        print(
+            f"OK: {len(events)} events ({fs_count} filesystem, {sys_count} system) in "
+            f"{args.log_dir / 'events.jsonl'}"
+        )
+    return 0
+
+
+def cmd_recent(args) -> int:
+    if args.count < 0:
+        raise ChangeLogError("count must be non-negative")
+    with LogLock(args.log_dir, exclusive=False) as lock:
+        events = load_events(args.log_dir, directory=lock.directory)
+    selected = events[-args.count :] if args.count else events
+    for event in selected:
+        if args.json:
+            print(json.dumps(event, ensure_ascii=False, sort_keys=True))
+            continue
+        if event["category"] == "filesystem":
+            paths = _event_paths(event)
+            affected = ", ".join(paths)
+        else:
+            affected = event.get("resource", "")
+        print(
+            f"{event['ts']} [{event['action']}] {affected} — {event['description']} "
+            f"(actor={event['actor']}, id={event['id']})"
+        )
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    # Suppress subparser defaults so global options survive after dispatch.
+    common = argparse.ArgumentParser(add_help=False, argument_default=argparse.SUPPRESS)
+    common.add_argument(
+        "--log-dir",
+        type=Path,
+        help="log directory (default: $AGENT_CHANGE_LOG_DIR or ~/.local/state/agent-change-log)",
+    )
+    common.add_argument("--actor", help="actor name (default: derived from environment)")
+    common.add_argument("--session", help="session or transaction id (default: $PI_SESSION_ID)")
+    common.add_argument("--cwd", help="working directory associated with the change")
+    common.add_argument("--tool", help="tool that made the change")
+    common.add_argument("--tool-call-id", help="tool call id")
+    common.add_argument("--parent-tool-call-id", help="parent tool call id for nested calls")
+    common.add_argument("--origin", help="origin such as cli, pi-extension, script")
+    common.add_argument("--no-report", action="store_true", default=argparse.SUPPRESS, help="do not regenerate CHANGELOG.md")
+    common.add_argument("--quiet", action="store_true", default=argparse.SUPPRESS, help="suppress normal output")
+
+    parser = argparse.ArgumentParser(
+        prog="agent-change-log",
+        description="Append-only persistent change history for this computer.",
+        parents=[common],
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("file", parents=[common], help="record a filesystem change")
+    p.add_argument("action", choices=("create", "modify", "delete"))
+    p.add_argument("paths", nargs="+", metavar="PATH")
+    p.add_argument("--description", required=True)
+    p.set_defaults(func=cmd_file)
+
+    p = sub.add_parser("move", parents=[common], help="record a move or rename")
+    p.add_argument("source", metavar="SOURCE")
+    p.add_argument("destination", metavar="DESTINATION")
+    p.add_argument("--description", required=True)
+    p.set_defaults(func=cmd_move)
+
+    p = sub.add_parser("system", parents=[common], help="record a system-level change")
+    p.add_argument("--action", default="change", help="system action, e.g. change, service, package, config")
+    p.add_argument("--resource", required=True, help="resource, e.g. systemd:nginx.service or package:jq")
+    p.add_argument("--path", action="append", help="optional affected path (repeatable)")
+    p.add_argument("--description", required=True)
+    p.set_defaults(func=cmd_system)
+
+    p = sub.add_parser("record-json", parents=[common], help="record one complete event from JSON")
+    p.add_argument("--json", help="event as a JSON object")
+    p.add_argument("--file", help="read event JSON from a file")
+    p.set_defaults(func=cmd_record_json)
+
+    p = sub.add_parser("report", parents=[common], help="regenerate CHANGELOG.md from events.jsonl")
+    p.set_defaults(func=cmd_report)
+
+    p = sub.add_parser("validate", parents=[common], help="validate the canonical event log")
+    p.set_defaults(func=cmd_validate)
+
+    p = sub.add_parser("recent", parents=[common], help="show recent events")
+    p.add_argument("-n", "--count", type=int, default=20, help="number of events (0 = all)")
+    p.add_argument("--json", action="store_true", help="print raw JSON events")
+    p.set_defaults(func=cmd_recent)
+
+    return parser
+
+
+def _prescanned_log_dir(argv: list[str]) -> str | None:
+    value = None
+    for index, arg in enumerate(argv):
+        if arg == "--log-dir" and index + 1 < len(argv):
+            value = argv[index + 1]
+        elif arg.startswith("--log-dir="):
+            value = arg.split("=", 1)[1]
+    return value
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    args = parser.parse_args(raw_argv)
+    for key in ("log_dir", "actor", "session", "cwd", "tool", "tool_call_id",
+                "parent_tool_call_id", "origin"):
+        if not hasattr(args, key):
+            setattr(args, key, None)
+    for key in ("no_report", "quiet"):
+        if not hasattr(args, key):
+            setattr(args, key, False)
+    prescanned_log_dir = _prescanned_log_dir(raw_argv)
+    if prescanned_log_dir is not None:
+        args.log_dir = Path(prescanned_log_dir)
+    elif args.log_dir is None:
+        args.log_dir = default_log_dir()
+    args.log_dir = Path(os.path.abspath(os.path.expanduser(str(args.log_dir))))
+    try:
+        return args.func(args)
+    except ChangeLogError as exc:
+        print(f"agent-change-log: error: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        if exc.errno == errno.ENOSPC:
+            print("agent-change-log: error: no space left on device", file=sys.stderr)
+        else:
+            print(f"agent-change-log: error: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("agent-change-log: interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,41 @@
+{
+  "name": "agent-change-log",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local append-only change history CLI and confidentiality-conscious Pi extension",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "change-log",
+    "audit"
+  ],
+  "bin": {
+    "agent-change-log": "./bin/agent-change-log"
+  },
+  "files": [
+    "bin/agent-change-log",
+    "extensions/agent-change-log.ts",
+    "README.md",
+    "FEATURES.md",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "examples/",
+    "tests/"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/agent-change-log.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test:cli": "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v",
+    "test:extension": "node --test tests/extension.test.mjs",
+    "test": "npm run test:cli && npm run test:extension"
+  }
+}

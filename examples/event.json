@@ -1,0 +1,12 @@
+{
+  "category": "system",
+  "action": "config",
+  "resource": "example:application",
+  "description": "Synthetic example configuration update",
+  "host": "example-host",
+  "actor": "example-agent",
+  "origin": "example",
+  "meta": {
+    "verified": true
+  }
+}

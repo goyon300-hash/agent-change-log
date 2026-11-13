@@ -1,0 +1,24 @@
+# Dependencies and build outputs
+node_modules/
+dist/
+build/
+coverage/
+*.tgz
+__pycache__/
+*.py[cod]
+.pytest_cache/
+# Runtime state: never publish real event history
+logs/
+state/
+events.jsonl
+events.jsonl.lock
+.CHANGELOG.*.tmp
+# Local credentials and configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+auth.json
+.DS_Store
